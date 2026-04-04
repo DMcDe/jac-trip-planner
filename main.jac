@@ -90,39 +90,6 @@ def search_web(query: str) -> str {
 }
 sem search_web = "Use Tavily live web search to gather current public web information.";
 
-"""Tavily search tuned for airfare comparison (feeds the flight parser)."""
-def search_flights_tavily(origin: str, destination: str, start_date: str, end_date: str) -> str {
-    q = (
-        f"cheapest economy flights from {origin} to {destination} "
-        + f"depart around {start_date} return or finish travel by {end_date} "
-        + "lowest price USD per person Kayak Skyscanner Google Flights Expedia Momondo. Make sure to consider round trip flights."
-    );
-    return tavily_search(q, 12);
-}
-sem search_flights_tavily = "Use Tavily to retrieve current public web pages and summaries about cheap flight prices for the given route and dates.";
-
-def parse_top_cheapest_flights(
-    origin: str,
-    destination: str,
-    start_date: str,
-    end_date: str,
-    web_context: str
-) -> list[Flight] by llm();
-sem parse_top_cheapest_flights = "web_context is raw Tavily web search text about airline ticket prices for this trip. Return exactly 3 Flight objects: the THREE CHEAPEST distinct realistic options (economy). Set src to the origin string, dst to the destination string. airline is the operating carrier name. flight_num is a cited flight number or 'N/A'. cost is numeric USD total per person for that option (use the lowest quoted or inferred fare). Order the list from cheapest to most expensive. If fewer than three fares appear, output one or two items only—do not invent fake airlines.";
-
-"""Keep at most the first n flights (LLM may return extras)."""
-def take_first_n_flights(flights: list[Flight], n: int) -> list[Flight] {
-    out: list[Flight] = [];
-    idx: int = 0;
-    for leg in flights {
-        if idx < n {
-            out = out + [leg];
-        }
-        idx = idx + 1;
-    }
-    return out;
-}
-
 def find_meal_with_context(city: str, web_context: str) -> list[Meal] by llm();
 sem find_meal_with_context = "Given a city and live web search context about restaurants there, return exactly 5 Meal objects. Each mealType must be exactly one of these three strings (uppercase): BREAKFAST, LUNCH, DINNER — pick whichever fits that restaurant best. cost is estimated meal price in USD (a number). restaurant is the venue name.";
 
@@ -178,31 +145,7 @@ def:pub conduct_flight_search(trip_id: str) -> list[Flight] {
         }
     }
     return [];
-    #find_flights_serpapi(departure_airport, arrival_airport, out_date, ret_date)
 }
-
-# def:pub find_cheapest_flights(trip_id: str) -> list[Flight] {
-#     for t in [root()-->][?:Trip] {
-#         if str(jid(t)) == trip_id {
-#             ctx = search_flights_tavily(
-#                 t.origin.strip(),
-#                 t.destination.strip(),
-#                 t.start_date.strip(),
-#                 t.end_date.strip()
-#             );
-#             found = parse_top_cheapest_flights(
-#                 t.origin.strip(),
-#                 t.destination.strip(),
-#                 t.start_date.strip(),
-#                 t.end_date.strip(),
-#                 ctx
-#             );
-#             t.flights = take_first_n_flights(found, 3);
-#             return t.flights;
-#         }
-#     }
-#     return [];
-# }
 
 
 """Map LLM or numeric junk to a display label; structured output often uses 1/2/3 or wrong ints."""
@@ -264,29 +207,6 @@ def:pub create_trip(origin: str, destination: str, start_date: str, end_date: st
     return trip[0];
 }
 
-# """Tavily + model: replace trip.flights with up to the 3 cheapest options found on the web."""
-# def:pub find_cheapest_flights(trip_id: str) -> list[Flight] {
-#     for t in [root()-->][?:Trip] {
-#         if str(jid(t)) == trip_id {
-#             ctx = search_flights_tavily(
-#                 t.origin.strip(),
-#                 t.destination.strip(),
-#                 t.start_date.strip(),
-#                 t.end_date.strip()
-#             );
-#             found = parse_top_cheapest_flights(
-#                 t.origin.strip(),
-#                 t.destination.strip(),
-#                 t.start_date.strip(),
-#                 t.end_date.strip(),
-#                 ctx
-#             );
-#             t.flights = take_first_n_flights(found, 3);
-#             return t.flights;
-#         }
-#     }
-#     return [];
-# }
 
 """Get all trips."""
 def:pub get_trips -> list[Trip] {
