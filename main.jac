@@ -1,15 +1,19 @@
 """Main entry point for trip-planner."""
 
 import from byllm.lib { Model }
-import os, requests;
+import os;
 import from dotenv { load_dotenv }
+import from tavily { TavilyClient }
 # Client-side imports (useState is auto-injected when using `has` variables)
 cl import "./styles.css";
 
 glob llm = Model(model_name="huggingface/Qwen/Qwen2.5-Coder-7B-Instruct");
 
 node Trip {
-    has destination: str,
+    has origin: str,
+        destination: str,
+        start_date: str,
+        end_date: str,
         flights: list[Flight] = [],
         stays: list[Stay] = [],
         meals: list[Meal] = [],
@@ -32,15 +36,13 @@ obj Stay {
     has cost: float;
 }
 
-enum MealType { BREAKFAST, LUNCH, DINNER }
-
 obj Meal {
     has restaurant: str;
-    has mealType: MealType;
+    has mealType: str;
     has cost: float;
 }
 sem Meal.cost = "Estimated cost for a meal in USD";
-sem Meal.mealType = "The type of the meal, either BREAKFAST, LUNCH, or DINNER";
+sem Meal.mealType = "The type of the meal as a string: BREAKFAST, LUNCH, or DINNER";
 sem Meal.restaurant = "The name of the restaurant.";
 
 """Search the live web for restaurant options in a city and return concise results."""
@@ -51,23 +53,14 @@ def search_web(query: str) -> str {
         return "Web search unavailable: set TAVILY_API_KEY in the server environment.";
     }
 
-    resp = requests.post(
-        "https://api.tavily.com/search",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "query": query,
-            "topic": "general",
-            "search_depth": "advanced",
-            "max_results": 5,
-            "include_answer": True
-        },
-        timeout=20
+    tavily = TavilyClient(api_key=api_key);
+    body = tavily.search(
+        query=query,
+        topic="general",
+        search_depth="advanced",
+        max_results=5,
+        include_answer=True
     );
-    resp.raise_for_status();
-    body = resp.json();
 
     answer = body.get("answer", "");
     results = body.get("results", []);
@@ -95,8 +88,13 @@ walker:pub add_meal {
 }
 
 """Add a trip and return it"""
-def:pub create_trip(destination: str) -> Trip {
-    trip = root() ++> Trip(destination=destination);
+def:pub create_trip(origin: str, destination: str, start_date: str, end_date: str) -> Trip {
+    trip = root() ++> Trip(
+        origin=origin,
+        destination=destination,
+        start_date=start_date,
+        end_date=end_date
+    );
     return trip[0];
 }
 
@@ -113,17 +111,28 @@ def:pub get_trips -> list[Trip] {
 
 cl def:pub app -> JsxElement {
     has trips: list[Trip] = [],
-        input_text:str = "";
+        origin_text: str = "",
+        destination_text: str = "",
+        start_date_text: str = "",
+        end_date_text: str = "";
 
     async can with entry {
         trips = await get_trips();
     }
 
     async def add_new_trip {
-        if input_text.strip() {
-            trip = await create_trip(input_text.strip());
+        if origin_text.strip() and destination_text.strip() and start_date_text.strip() and end_date_text.strip() {
+            trip = await create_trip(
+                origin_text.strip(),
+                destination_text.strip(),
+                start_date_text.strip(),
+                end_date_text.strip()
+            );
             trips = trips + [trip];
-            input_text = "";
+            origin_text = "";
+            destination_text = "";
+            start_date_text = "";
+            end_date_text = "";
         }
     }
 
@@ -142,18 +151,45 @@ cl def:pub app -> JsxElement {
             <div class="input-row">
                 <input
                     class="input"
-                    value={input_text}
-                    onChange={lambda e: ChangeEvent { input_text = e.target.value; }}
+                    value={origin_text}
+                    onChange={lambda e: ChangeEvent { origin_text = e.target.value; }}
                     onKeyPress={lambda e: KeyboardEvent {
                         if e.key == "Enter" { add_new_trip(); }
                     }}
-                    placeholder="What needs to be done today?"
+                    placeholder="Origin city"
+                />
+                <input
+                    class="input"
+                    value={destination_text}
+                    onChange={lambda e: ChangeEvent { destination_text = e.target.value; }}
+                    onKeyPress={lambda e: KeyboardEvent {
+                        if e.key == "Enter" { add_new_trip(); }
+                    }}
+                    placeholder="Destination city"
+                />
+                <input
+                    class="input"
+                    type="date"
+                    value={start_date_text}
+                    onChange={lambda e: ChangeEvent { start_date_text = e.target.value; }}
+                    onKeyPress={lambda e: KeyboardEvent {
+                        if e.key == "Enter" { add_new_trip(); }
+                    }}
+                />
+                <input
+                    class="input"
+                    type="date"
+                    value={end_date_text}
+                    onChange={lambda e: ChangeEvent { end_date_text = e.target.value; }}
+                    onKeyPress={lambda e: KeyboardEvent {
+                        if e.key == "Enter" { add_new_trip(); }
+                    }}
                 />
                 <button class="btn-add" onClick={add_new_trip}>Add</button>
             </div>
             {[
                 <div key={jid(t)} class="task-item">
-                    <span class="task-title">{t.destination}</span>
+                    <span class="task-title">{f"{t.origin} -> {t.destination} ({t.start_date} to {t.end_date})"}</span>
                     <button class="btn-add" onClick={lambda { add_new_meal(t); }}>Meal</button>
                     {
                         <div>
