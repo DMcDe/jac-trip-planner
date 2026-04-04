@@ -3,7 +3,7 @@
 import from byllm.lib { Model }
 import os, requests;
 import from dotenv { load_dotenv }
-# Client-side imports (useState is auto-injected when using `has` variables)
+
 cl import "./styles.css";
 
 glob llm = Model(model_name="huggingface/Qwen/Qwen2.5-Coder-7B-Instruct");
@@ -32,26 +32,23 @@ obj Stay {
     has cost: float;
 }
 
-enum MealType { BREAKFAST, LUNCH, DINNER }
-
 obj Meal {
     has restaurant: str;
-    has mealType: MealType;
+    has mealType: str;
     has cost: float;
 }
-sem Meal.cost = "Estimated cost for a meal in USD";
-sem Meal.mealType = "The type of the meal, either BREAKFAST, LUNCH, or DINNER";
-sem Meal.restaurant = "The name of the restaurant.";
 
 """Search the live web for restaurant options in a city and return concise results."""
 def search_web(query: str) -> str {
+    import from typing { Any }
+
     load_dotenv();
     api_key = os.getenv("TAVILY_API_KEY");
     if not api_key {
         return "Web search unavailable: set TAVILY_API_KEY in the server environment.";
     }
 
-    resp = requests.post(
+    resp: Any = requests.post(
         "https://api.tavily.com/search",
         headers={
             "Authorization": f"Bearer {api_key}",
@@ -67,31 +64,70 @@ def search_web(query: str) -> str {
         timeout=20
     );
     resp.raise_for_status();
-    body = resp.json();
+    body: Any = resp.json();
 
     answer = body.get("answer", "");
-    results = body.get("results", []);
-    snippets = [
-        f"{item.get('title', 'Untitled')}: {item.get('content', '')}"
-        for item in results
-    ];
+    results: Any = body.get("results", []);
+    snippets: list[str] = [];
+    for item in results {
+        row: Any = item;
+        line = f"{row.get('title', 'Untitled')}: {row.get('content', '')}";
+        snippets = snippets + [line];
+    }
     return "\n".join(([answer] if answer else []) + snippets);
 }
 sem search_web = "Use Tavily live web search to gather current public web information.";
 
 def find_meal_with_context(city: str, web_context: str) -> list[Meal] by llm();
-sem find_meal_with_context = "Given a city and live web search context about restaurants there, return exactly 5 real restaurant meal options as a list of Meal objects with restaurant, best meal type, and estimated meal cost in USD.";
+sem find_meal_with_context = "Given a city and live web search context about restaurants there, return exactly 5 Meal objects. Each mealType must be exactly one of these three strings (uppercase): BREAKFAST, LUNCH, DINNER — pick whichever fits that restaurant best. cost is estimated meal price in USD (a number). restaurant is the venue name.";
 
-walker:pub add_meal {
-    can add with Trip entry {
-        city = here.destination;
-        web_context = search_web(f"most popular restaurants in {city} with must try dishes and  affordable price range");
-        print(f"web context{web_context}");
-        meals = find_meal_with_context(city, web_context);
-        print(f"meals{meals}");
-        here.meals = here.meals + meals;
-        report meals;
+
+"""Map LLM or numeric junk to a display label; structured output often uses 1/2/3 or wrong ints."""
+def normalize_meal_type(raw: str) -> str {
+    s = str(raw).strip().upper();
+    if s == "1" or s == "BREAKFAST" {
+        return "BREAKFAST";
     }
+    if s == "2" or s == "LUNCH" {
+        return "LUNCH";
+    }
+    if s == "3" or s == "DINNER" {
+        return "DINNER";
+    }
+    if "BREAKFAST" in s {
+        return "BREAKFAST";
+    }
+    if "LUNCH" in s {
+        return "LUNCH";
+    }
+    if "DINNER" in s {
+        return "DINNER";
+    }
+    return "DINNER";
+}
+
+"""Apply normalize_meal_type to each meal (mutate in place for graph persistence)."""
+def normalize_meals(meals: list[Meal]) -> list[Meal] {
+    for m in meals {
+        m.mealType = normalize_meal_type(m.mealType);
+    }
+    return meals;
+}
+
+"""Enrich a trip with meal ideas (server-side graph + LLM). Client must pass *trip_id* (string); search uses that trip's *destination* (HTTP API rejects Trip objects in the body)."""
+def:pub add_meal(trip_id: str) -> list[Meal] {
+    for t in [root()-->][?:Trip] {
+        if str(jid(t)) == trip_id {
+            city = t.destination.strip();
+            web_context = search_web(
+                f"most popular restaurants in {city} with must try dishes and affordable price range"
+            );
+            meals = normalize_meals(find_meal_with_context(city, web_context));
+            t.meals = t.meals + meals;
+            return t.meals;
+        }
+    }
+    return [];
 }
 
 """Add a trip and return it"""
@@ -113,7 +149,7 @@ def:pub get_trips -> list[Trip] {
 
 cl def:pub app -> JsxElement {
     has trips: list[Trip] = [],
-        input_text:str = "";
+        input_text: str = "";
 
     async can with entry {
         trips = await get_trips();
@@ -128,43 +164,93 @@ cl def:pub app -> JsxElement {
     }
 
     async def add_new_meal(trip: Trip) {
-        result = await jid(trip) spawn add_meal();
-        if result.reports and result.reports.length > 0 {
-            trip.meals = trip.meals + result.reports[0];
-            trips = trips + [];
-        }
+        trip.meals = await add_meal(str(jid(trip)));
+        trips = [x for x in trips];
     }
 
+    def meal_rows(trip: Trip) -> list[JsxElement] {
+        out: list[JsxElement] = [];
+        idx: int = 0;
+        for m in trip.meals {
+            label = f"{m.restaurant} · {m.mealType} · " + str(m.cost) + " USD";
+            meal_key = str(jid(trip)) + "-meal-" + str(idx);
+            out = out + [
+                <li key={meal_key} class="meal-item">
+                    {label}
+                </li>
+            ];
+            idx += 1;
+        }
+        return out;
+    }
 
-    return 
-        <div class="container">
-            <h1>Trip Planner</h1>
-            <div class="input-row">
-                <input
-                    class="input"
-                    value={input_text}
-                    onChange={lambda e: ChangeEvent { input_text = e.target.value; }}
-                    onKeyPress={lambda e: KeyboardEvent {
-                        if e.key == "Enter" { add_new_trip(); }
-                    }}
-                    placeholder="What needs to be done today?"
-                />
-                <button class="btn-add" onClick={add_new_trip}>Add</button>
-            </div>
-            {[
-                <div key={jid(t)} class="task-item">
-                    <span class="task-title">{t.destination}</span>
-                    <button class="btn-add" onClick={lambda { add_new_meal(t); }}>Meal</button>
+    def trip_card(trip: Trip) -> JsxElement {
+        return
+            <article class="trip-card" key={jid(trip)}>
+                <div class="trip-card-head">
+                    <h2 class="trip-destination">{trip.destination}</h2>
+                    <button
+                        type="button"
+                        class="btn btn-secondary"
+                        onClick={lambda { add_new_meal(trip); }}
+                    >
+                        Find meals
+                    </button>
+                </div>
+                {
+                    <ul class="meal-list">{meal_rows(trip)}</ul>
+                    if len(trip.meals) > 0
+                    else <p class="trip-empty">No meal ideas yet — use Find meals for AI suggestions.</p>
+                }
+            </article>;
+    }
+
+    def trip_grid_cards() -> list[JsxElement] {
+        return [trip_card(trip=t) for t in trips];
+    }
+
+    return
+        <div class="app">
+            <header class="site-header">
+                <div class="site-header-inner">
+                    <p class="eyebrow">Jac trip planner</p>
+                    <h1 class="site-title">Plan trips and discover meals</h1>
+                    <p class="site-lede">
+                        Add a destination, then pull restaurant ideas backed by live search and the model.
+                    </p>
+                </div>
+            </header>
+            <main class="main">
+                <section class="panel panel-add" aria-label="Add destination">
+                    <label class="label" for="dest-input">Where to next?</label>
+                    <div class="add-row">
+                        <input
+                            id="dest-input"
+                            class="input"
+                            value={input_text}
+                            onChange={lambda e: ChangeEvent { input_text = e.target.value; }}
+                            onKeyDown={lambda e: KeyboardEvent {
+                                if e.key == "Enter" { add_new_trip(); }
+                            }}
+                            placeholder="e.g. Lisbon, Tokyo, Austin"
+                            autoComplete="off"
+                        />
+                        <button type="button" class="btn btn-primary" onClick={add_new_trip}>
+                            Add trip
+                        </button>
+                    </div>
+                </section>
+                <section class="trips-section" aria-label="Your trips">
                     {
-                        <div>
-                            {[
-                                <div key={f"{jid(t)}-{meal.restaurant}"} class="task-title">
-                                    {f"{meal.restaurant} ({meal.mealType}) - ${meal.cost}"}
-                                </div> for meal in t.meals
-                            ]}
-                        </div> if len(t.meals) > 0 else <></>
+                        <div class="trip-grid">{trip_grid_cards()}</div>
+                        if len(trips) > 0
+                        else
+                            <div class="empty-state">
+                                <p class="empty-title">No trips yet</p>
+                                <p class="empty-copy">Enter a city above to start your list.</p>
+                            </div>
                     }
-                </div> for t in trips
-            ]}
+                </section>
+            </main>
         </div>;
 }
