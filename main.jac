@@ -2,6 +2,7 @@
 
 import from byllm.lib { Model }
 import os, requests;
+import serpapi;
 import from dotenv { load_dotenv }
 
 cl import "./styles.css";
@@ -126,6 +127,84 @@ def find_meal_with_context(city: str, web_context: str) -> list[Meal] by llm();
 sem find_meal_with_context = "Given a city and live web search context about restaurants there, return exactly 5 Meal objects. Each mealType must be exactly one of these three strings (uppercase): BREAKFAST, LUNCH, DINNER — pick whichever fits that restaurant best. cost is estimated meal price in USD (a number). restaurant is the venue name.";
 
 
+
+def find_flights_serpapi(departure: str, arrival: str, outbound_date: str, return_date: str) -> object {
+    client = serpapi.Client(api_key="a4a3a49124193634da2f6323b3abee781ea62309a073da69b486dcc031d53ab7");
+    results = client.search({
+        "engine": "google_flights",
+        "departure_id": departure,
+        "arrival_id": arrival,
+        "currency": "USD",
+        "type": "1",
+        "outbound_date": outbound_date,
+        "return_date": return_date,
+        "deep_search": "true",
+        "sort_by": "2"
+    });
+
+    print(results);
+    return results;
+}
+
+def find_airport_code_tavily(city: str) -> str {
+    q = (
+        f"find the closest major airport to {city} and return the airport code, which is typically three capital letters."
+    );
+    return tavily_search(q, 1);
+}
+
+def formate_date(date: str) -> str by llm();
+sem formate_date = "Given plaintext format for a date, return the same date as a string in YYYY-MM-DD format"
+
+def format_airport_code(input: str) -> str by llm();
+sem format_airport_code = "Given plaintext information about the closest airport to a major city, select the closest airport and return only the 3 letter capital airport code for the airport."
+
+def format_flights(input: object) -> list[Flight] by llm();
+sem format_flights = "Given json input with a list of flight information, create a list of the first 3 flights as Flight objects, using the fields: airline, flight_number, price, departure_airport, arrival_airport"
+
+def:pub conduct_flight_search(trip_id: str) -> list[Flight] {
+    for t in [root()-->][?:Trip] {
+        if str(jid(t)) == trip_id {
+            departure_airport = format_airport_code(find_airport_code_tavily(t.origin.strip()));
+            arrival_airport = format_airport_code(find_airport_code_tavily(t.destination.strip()));
+            departure_date = formate_date(t.start_date.strip());
+            arrival_date = formate_date(t.end_date.strip());
+            #print(depart_format);
+            #print (departure_airport, arrival_airport, out_date, ret_date);
+            print("here1");
+            api_output = find_flights_serpapi(departure_airport, arrival_airport, departure_date, arrival_date);
+            print(api_output);
+            return format_flights(api_output);
+        }
+    }
+    return [];
+    #find_flights_serpapi(departure_airport, arrival_airport, out_date, ret_date)
+}
+
+# def:pub find_cheapest_flights(trip_id: str) -> list[Flight] {
+#     for t in [root()-->][?:Trip] {
+#         if str(jid(t)) == trip_id {
+#             ctx = search_flights_tavily(
+#                 t.origin.strip(),
+#                 t.destination.strip(),
+#                 t.start_date.strip(),
+#                 t.end_date.strip()
+#             );
+#             found = parse_top_cheapest_flights(
+#                 t.origin.strip(),
+#                 t.destination.strip(),
+#                 t.start_date.strip(),
+#                 t.end_date.strip(),
+#                 ctx
+#             );
+#             t.flights = take_first_n_flights(found, 3);
+#             return t.flights;
+#         }
+#     }
+#     return [];
+# }
+
+
 """Map LLM or numeric junk to a display label; structured output often uses 1/2/3 or wrong ints."""
 def normalize_meal_type(raw: str) -> str {
     s = str(raw).strip().upper();
@@ -185,29 +264,29 @@ def:pub create_trip(origin: str, destination: str, start_date: str, end_date: st
     return trip[0];
 }
 
-"""Tavily + model: replace trip.flights with up to the 3 cheapest options found on the web."""
-def:pub find_cheapest_flights(trip_id: str) -> list[Flight] {
-    for t in [root()-->][?:Trip] {
-        if str(jid(t)) == trip_id {
-            ctx = search_flights_tavily(
-                t.origin.strip(),
-                t.destination.strip(),
-                t.start_date.strip(),
-                t.end_date.strip()
-            );
-            found = parse_top_cheapest_flights(
-                t.origin.strip(),
-                t.destination.strip(),
-                t.start_date.strip(),
-                t.end_date.strip(),
-                ctx
-            );
-            t.flights = take_first_n_flights(found, 3);
-            return t.flights;
-        }
-    }
-    return [];
-}
+# """Tavily + model: replace trip.flights with up to the 3 cheapest options found on the web."""
+# def:pub find_cheapest_flights(trip_id: str) -> list[Flight] {
+#     for t in [root()-->][?:Trip] {
+#         if str(jid(t)) == trip_id {
+#             ctx = search_flights_tavily(
+#                 t.origin.strip(),
+#                 t.destination.strip(),
+#                 t.start_date.strip(),
+#                 t.end_date.strip()
+#             );
+#             found = parse_top_cheapest_flights(
+#                 t.origin.strip(),
+#                 t.destination.strip(),
+#                 t.start_date.strip(),
+#                 t.end_date.strip(),
+#                 ctx
+#             );
+#             t.flights = take_first_n_flights(found, 3);
+#             return t.flights;
+#         }
+#     }
+#     return [];
+# }
 
 """Get all trips."""
 def:pub get_trips -> list[Trip] {
@@ -242,7 +321,7 @@ cl def:pub app -> JsxElement {
     }
 
     async def search_cheapest_flights(trip: Trip) {
-        trip.flights = await find_cheapest_flights(str(jid(trip)));
+        trip.flights = await conduct_flight_search(str(jid(trip)));
         trips = [x for x in trips];
     }
 
