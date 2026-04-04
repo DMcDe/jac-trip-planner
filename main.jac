@@ -93,8 +93,6 @@ sem search_web = "Use Tavily live web search to gather current public web inform
 def find_meal_with_context(city: str, web_context: str) -> list[Meal] by llm();
 sem find_meal_with_context = "Given a city and live web search context about restaurants there, return exactly 5 Meal objects. Each mealType must be exactly one of these three strings (uppercase): BREAKFAST, LUNCH, DINNER — pick whichever fits that restaurant best. cost is estimated meal price in USD (a number). restaurant is the venue name.";
 
-
-
 def find_flights_serpapi(departure: str, arrival: str, outbound_date: str, return_date: str) -> object {
     client = serpapi.Client(api_key="a4a3a49124193634da2f6323b3abee781ea62309a073da69b486dcc031d53ab7");
     results = client.search({
@@ -120,22 +118,26 @@ def find_airport_code_tavily(city: str) -> str {
     return tavily_search(q, 1);
 }
 
-def formate_date(date: str) -> str by llm();
-sem formate_date = "Given plaintext format for a date, return the same date as a string in YYYY-MM-DD format"
+def format_date(date: str) -> str by llm();
+sem format_date = "Given plaintext format for a date, return the same date as a string in YYYY-MM-DD format"
 
 def format_airport_code(input: str) -> str by llm();
 sem format_airport_code = "Given plaintext information about the closest airport to a major city, select the closest airport and return only the 3 letter capital airport code for the airport."
 
 def format_flights(input: object) -> list[Flight] by llm();
-sem format_flights = "Given json input with a list of flight information, create a list of the first 3 flights as Flight objects, using the fields: airline, flight_number, price, departure_airport, arrival_airport"
+sem format_flights = """
+Given json inputs with a list of flight information, find the best_flights list. 
+Take the first 3 flight json objects in the list and turn them into Flight objects.
+Use the fields: airline, flight_number, price, departure_airport (name and time), and arrival_airport (name and time).
+"""
 
 def:pub conduct_flight_search(trip_id: str) -> list[Flight] {
     for t in [root()-->][?:Trip] {
         if str(jid(t)) == trip_id {
             departure_airport = format_airport_code(find_airport_code_tavily(t.origin.strip()));
             arrival_airport = format_airport_code(find_airport_code_tavily(t.destination.strip()));
-            departure_date = formate_date(t.start_date.strip());
-            arrival_date = formate_date(t.end_date.strip());
+            departure_date = format_date(t.start_date.strip());
+            arrival_date = format_date(t.end_date.strip());
             #print(depart_format);
             #print (departure_airport, arrival_airport, out_date, ret_date);
             print("here1");
