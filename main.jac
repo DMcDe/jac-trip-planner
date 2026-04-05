@@ -93,6 +93,54 @@ sem search_web = "Use Tavily live web search to gather current public web inform
 def find_meal_with_context(city: str, web_context: str) -> list[Meal] by llm();
 sem find_meal_with_context = "Given a city and live web search context about restaurants there, return exactly 5 Meal objects. Each mealType must be exactly one of these three strings (uppercase): BREAKFAST, LUNCH, DINNER — pick whichever fits that restaurant best. cost is estimated meal price in USD (a number). restaurant is the venue name.";
 
+"""Strip LLM-added quotes so SerpAPI gets bare YYYY-MM-DD (quoted dates cause 400 Bad Request)."""
+def strip_date_quotes(d: str) -> str {
+    s = str(d).strip();
+    n = len(s);
+    if n >= 2 and s[0] == "'" and s[n - 1] == "'" {
+        return s[1:n - 1].strip();
+    }
+    if n >= 2 and s[0] == "\"" and s[n - 1] == "\"" {
+        return s[1:n - 1].strip();
+    }
+    return s;
+}
+
+"""SerpAPI requires real calendar dates. LLM often emits impossible months (e.g. 2026-15-05 from US 5/15/2026)."""
+def normalize_iso_date_for_serpapi(raw: str) -> str {
+    import datetime;
+
+    s = str(raw).strip();
+    parts = s.split("-");
+    if len(parts) != 3 {
+        return s;
+    }
+    y = int(parts[0]);
+    a = int(parts[1]);
+    b = int(parts[2]);
+    m = a;
+    d = b;
+    if m > 12 and d >= 1 and d <= 12 {
+        m = b;
+        d = a;
+    }
+    dt = datetime.date(y, m, d);
+    return dt.isoformat();
+}
+
+"""SerpAPI google_flights expects 3-letter IATA. Tavily/LLM sometimes return ICAO (e.g. CYQG → YQG, KJFK → JFK)."""
+def normalize_airport_code_for_serpapi(raw: str) -> str {
+    s = str(raw).strip().upper();
+    n = len(s);
+    if n == 4 {
+        c0 = s[0];
+        if c0 == "C" or c0 == "K" {
+            return s[1:4];
+        }
+    }
+    return s;
+}
+
 def find_flights_serpapi(departure: str, arrival: str, outbound_date: str, return_date: str) -> object {
     client = serpapi.Client(api_key="a4a3a49124193634da2f6323b3abee781ea62309a073da69b486dcc031d53ab7");
     results = client.search({
@@ -111,39 +159,123 @@ def find_flights_serpapi(departure: str, arrival: str, outbound_date: str, retur
     return results;
 }
 
-def find_airport_code_tavily(city: str) -> str {
+def format_date(date: str) -> str by llm();
+sem format_date = "Convert the input to ISO date YYYY-MM-DD only. If the input is US style month/day/year (e.g. 5/15/2026, 05/15/2026), month is 1-12 and day is 1-31 — never put the day in the middle. Example: May 15 2026 → 2026-05-15 not 2026-15-05. No quotes or extra text."
+
+"""Web facts about which airport serves the place; the model chooses one consistent IATA + dining city (no hardcoded geography)."""
+def airport_facts_context(place_text: str) -> str {
     q = (
-        f"find the closest major airport to {city} and return the airport code, which is typically three capital letters."
+        f"For commercial airline travel to or from this place or metro: {place_text}. "
+        f"Give the primary passenger airport travelers use: IATA code, official airport name, and the city or region it serves. "
+        f"If multiple airports exist, identify the main hub for typical itineraries."
     );
-    return tavily_search(q, 1);
+    return tavily_search(q, 3);
 }
 
-def format_date(date: str) -> str by llm();
-sem format_date = "Given plaintext format for a date, return the same date as a string in YYYY-MM-DD format"
+obj TravelEndpoint {
+    has iata: str;
+    has meal_city: str;
+}
+sem TravelEndpoint.iata = "Exactly three letters: the IATA code from web_context for the airport that best matches place_text.";
+sem TravelEndpoint.meal_city = "One city name for restaurant search near that airport (how visitors usually refer to the area).";
 
-def format_airport_code(input: str) -> str by llm();
-sem format_airport_code = "Given plaintext information about the closest airport to a major city, select the closest airport and return only the 3 letter capital airport code for the airport."
+def parse_travel_endpoint(place_text: str, web_context: str) -> TravelEndpoint by llm();
+sem parse_travel_endpoint = """
+place_text is the user's origin or destination phrase. web_context is factual search results about airports for that place.
 
-def format_flights(input: object) -> list[Flight] by llm();
-sem format_flights = """
-Given json inputs with a list of flight information, find the best_flights list. 
-Take the first 3 flight json objects in the list and turn them into Flight objects.
-Use the fields: airline, flight_number, price, departure_airport (name and time), and arrival_airport (name and time).
-"""
+Return TravelEndpoint:
+- iata: single primary passenger airport IATA code. Ground the choice in web_context; do not invent codes.
+- meal_city: the city to use when searching for restaurants near that airport.
+
+Use place_text together with web_context to resolve ambiguity: pick the airport that serves the geographic location the user meant (including spelling variants), not a distant or unrelated namesake. If web_context is empty or unusable, infer carefully from place_text only.
+
+iata must be three A-Z letters. meal_city must be a place name, not a code.
+""";
+
+"""One Tavily + one structured parse per place; SerpAPI and meals both use this so they stay aligned."""
+def resolve_place_for_travel(place_text: str) -> TravelEndpoint {
+    ctx = airport_facts_context(place_text.strip());
+    ep = parse_travel_endpoint(place_text.strip(), ctx);
+    return TravelEndpoint(
+        iata=normalize_airport_code_for_serpapi(strip_date_quotes(str(ep.iata).strip())),
+        meal_city=strip_date_quotes(str(ep.meal_city).strip())
+    );
+}
+
+"""Map SerpAPI google_flights JSON to Flight objects (LLM prompt used wrong field names vs Flight.cost/src/dst)."""
+def flights_from_serpapi_results(results: object) -> list[Flight] {
+    import from typing { Any }
+
+    data: Any = results;
+    rows: Any = data.get("best_flights");
+    if not rows {
+        rows = data.get("other_flights", []);
+    }
+    if not rows {
+        rows = [];
+    }
+    out: list[Flight] = [];
+    idx: int = 0;
+    for opt in rows {
+        if idx < 3 {
+            legs: Any = opt.get("flights", []);
+            if len(legs) > 0 {
+                first_leg: Any = legs[0];
+                last_leg: Any = legs[len(legs) - 1];
+                dep_a: Any = first_leg.get("departure_airport", {});
+                arr_a: Any = last_leg.get("arrival_airport", {});
+                src = f"{dep_a.get('name', '')} {dep_a.get('time', '')}".strip();
+                dst = f"{arr_a.get('name', '')} {arr_a.get('time', '')}".strip();
+                airline = str(first_leg.get("airline", "")).strip();
+                if not airline {
+                    airline = "Flight";
+                }
+                fn_parts: list[str] = [];
+                for lg in legs {
+                    fn = str(lg.get("flight_number", "")).strip();
+                    if fn {
+                        fn_parts = fn_parts + [fn];
+                    }
+                }
+                flight_num = " · ".join(fn_parts) if len(fn_parts) > 0 else "—";
+                pr: Any = opt.get("price", 0);
+                cost: float = float(pr);
+                out = out + [
+                    Flight(
+                        src=src,
+                        dst=dst,
+                        airline=airline,
+                        flight_num=flight_num,
+                        cost=cost
+                    )
+                ];
+                idx += 1;
+            }
+        }
+    }
+    return out;
+}
 
 def:pub conduct_flight_search(trip_id: str) -> list[Flight] {
     for t in [root()-->][?:Trip] {
         if str(jid(t)) == trip_id {
-            departure_airport = format_airport_code(find_airport_code_tavily(t.origin.strip()));
-            arrival_airport = format_airport_code(find_airport_code_tavily(t.destination.strip()));
-            departure_date = format_date(t.start_date.strip());
-            arrival_date = format_date(t.end_date.strip());
+            departure_airport = resolve_place_for_travel(t.origin).iata;
+            arrival_airport = resolve_place_for_travel(t.destination).iata;
+            departure_date = normalize_iso_date_for_serpapi(
+                strip_date_quotes(format_date(t.start_date.strip()))
+            );
+            arrival_date = normalize_iso_date_for_serpapi(
+                strip_date_quotes(format_date(t.end_date.strip()))
+            );
             #print(depart_format);
             #print (departure_airport, arrival_airport, out_date, ret_date);
-            print("here1");
+            print(
+                f"SerpAPI airports (resolved): {departure_airport} → {arrival_airport} "
+                f"dates {departure_date} / {arrival_date}"
+            );
             api_output = find_flights_serpapi(departure_airport, arrival_airport, departure_date, arrival_date);
             print(api_output);
-            return format_flights(api_output);
+            return flights_from_serpapi_results(api_output);
         }
     }
     return [];
@@ -182,11 +314,15 @@ def normalize_meals(meals: list[Meal]) -> list[Meal] {
     return meals;
 }
 
-"""Enrich a trip with meal ideas (server-side graph + LLM). Client must pass *trip_id* (string); search uses that trip's *destination* (HTTP API rejects Trip objects in the body)."""
+"""Enrich a trip with meal ideas (server-side graph + LLM). Meal city comes from the same TravelEndpoint as flight arrival resolution."""
 def:pub add_meal(trip_id: str) -> list[Meal] {
     for t in [root()-->][?:Trip] {
         if str(jid(t)) == trip_id {
-            city = t.destination.strip();
+            dest_ep = resolve_place_for_travel(t.destination);
+            city = dest_ep.meal_city;
+            if not city {
+                city = t.destination.strip();
+            }
             web_context = search_web(
                 f"most popular restaurants in {city} with must try dishes and affordable price range"
             );
