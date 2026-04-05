@@ -2,7 +2,6 @@
 
 import from byllm.lib { Model }
 import os, requests;
-import serpapi;
 import from dotenv { load_dotenv }
 
 cl import "./styles.css";
@@ -26,7 +25,11 @@ obj Flight {
     has airline: str;
     has flight_num: str;
     has cost: float;
+    has price_currency: str = "USD";
+    has fare_description: str = "";
 }
+sem Flight.price_currency = "ISO currency code SerpAPI used for the numeric price (we request USD in the API call).";
+sem Flight.fare_description = "Short note e.g. SerpAPI/Google Flights fare scope: Round trip, One way, etc.";
 
 obj Stay {
     has name: str;
@@ -40,10 +43,12 @@ obj Meal {
     has restaurant: str;
     has mealType: str;
     has cost: float;
+    has day_date: str = "";
 }
 sem Meal.cost = "Estimated cost for a meal in USD";
 sem Meal.mealType = "The type of the meal as a string: BREAKFAST, LUNCH, or DINNER";
 sem Meal.restaurant = "The name of the restaurant.";
+sem Meal.day_date = "ISO date YYYY-MM-DD for this meal slot in the trip itinerary; empty if not part of a day plan.";
 
 """Call Tavily search API; returns answer line plus page snippets (shared by meals + flights)."""
 def tavily_search(query: str, max_results: int) -> str {
@@ -90,8 +95,47 @@ def search_web(query: str) -> str {
 }
 sem search_web = "Use Tavily live web search to gather current public web information.";
 
-def find_meal_with_context(city: str, web_context: str) -> list[Meal] by llm();
-sem find_meal_with_context = "Given a city and live web search context about restaurants there, return exactly 5 Meal objects. Each mealType must be exactly one of these three strings (uppercase): BREAKFAST, LUNCH, DINNER — pick whichever fits that restaurant best. cost is estimated meal price in USD (a number). restaurant is the venue name.";
+"""Inclusive calendar dates from trip start to end (YYYY-MM-DD), normalized like flight dates."""
+def itinerary_dates_list(start_raw: str, end_raw: str) -> list[str] {
+    import datetime;
+
+    s = normalize_iso_date_for_serpapi(strip_date_quotes(format_date(start_raw.strip())));
+    e = normalize_iso_date_for_serpapi(strip_date_quotes(format_date(end_raw.strip())));
+    d0 = datetime.date.fromisoformat(s);
+    d1 = datetime.date.fromisoformat(e);
+    if d1 < d0 {
+        d1 = d0;
+    }
+    dates: list[str] = [];
+    cur = d0;
+    while cur <= d1 {
+        dates = dates + [cur.isoformat()];
+        cur = cur + datetime.timedelta(days=1);
+    }
+    return dates;
+}
+
+def find_meal_itinerary_with_context(
+    city: str,
+    web_context: str,
+    dates_csv: str,
+    num_days: int
+) -> list[Meal] by llm();
+sem find_meal_itinerary_with_context = """
+city is the destination dining area. web_context is live web search snippets (may include junk like site navigation).
+
+dates_csv is a comma-separated list of exactly num_days calendar dates in YYYY-MM-DD order — one date per day the traveler is on the trip (inclusive from start through end).
+
+Return exactly (2 * num_days) Meal objects in this strict order: walk the dates in dates_csv from first to last; for EACH date output two meals in a row — first mealType LUNCH, second mealType DINNER. Set day_date on each meal to that same YYYY-MM-DD date string (must match the list exactly).
+
+restaurant must be a REAL place name (café, restaurant, market stall, taqueria, etc.) that appears as a business in web_context OR is a well-known establishment in city. NEVER use page chrome: no "Table of Contents", "Skip to content", "Menu", "Home", "Search", "Sign in", "Cookie", "Privacy", "Subscribe", "Read more", section headings, or generic blog UI text. If a line in web_context is not a venue name, ignore it.
+
+Use different restaurant names across the itinerary when web_context supports enough distinct real venues; do not repeat the same restaurant for multiple meals unless unavoidable.
+
+cost is ONE person's estimated meal total in USD (number only, no symbols). Stay realistic and consistent across the trip: for the same city, casual/local lunch and dinner on the same tier should not jump from ~15 USD to ~300 USD unless web_context explicitly names a luxury or tasting-menu venue. Typical casual dining in many cities is often roughly 8–45 USD per meal; fine dining can be higher only when the context clearly supports it. Do not invent luxury prices for generic mentions.
+
+mealType must be exactly LUNCH or DINNER (uppercase) for every meal in this response.
+""";
 
 """Strip LLM-added quotes so SerpAPI gets bare YYYY-MM-DD (quoted dates cause 400 Bad Request)."""
 def strip_date_quotes(d: str) -> str {
@@ -142,19 +186,24 @@ def normalize_airport_code_for_serpapi(raw: str) -> str {
 }
 
 def find_flights_serpapi(departure: str, arrival: str, outbound_date: str, return_date: str) -> object {
-    client = serpapi.Client(api_key="a4a3a49124193634da2f6323b3abee781ea62309a073da69b486dcc031d53ab7");
-    results = client.search({
-        "engine": "google_flights",
-        "departure_id": departure,
-        "arrival_id": arrival,
-        "currency": "USD",
-        "type": "1",
-        "outbound_date": outbound_date,
-        "return_date": return_date,
-        "deep_search": "true",
-        "sort_by": "2"
-    });
+    # google-search-results exposes SerpApiClient + get_dict(), not serpapi.Client (that is the newer pip "serpapi" package).
+    import from serpapi.serp_api_client { SerpApiClient }
 
+    client = SerpApiClient(
+        {
+            "engine": "google_flights",
+            "departure_id": departure,
+            "arrival_id": arrival,
+            "currency": "USD",
+            "type": "1",
+            "outbound_date": outbound_date,
+            "return_date": return_date,
+            "deep_search": "true",
+            "sort_by": "2",
+            "api_key": "a4a3a49124193634da2f6323b3abee781ea62309a073da69b486dcc031d53ab7"
+        }
+    );
+    results = client.get_dict();
     print(results);
     return results;
 }
@@ -202,11 +251,55 @@ def resolve_place_for_travel(place_text: str) -> TravelEndpoint {
     );
 }
 
+"""Normalize SerpAPI best_flights price (usually int USD); no FX math in this app."""
+def serpapi_price_to_float(raw: object) -> float {
+    import from typing { Any }
+
+    r: Any = raw;
+    if r is None {
+        return 0.0;
+    }
+    if isinstance(r, bool) {
+        return 0.0;
+    }
+    if isinstance(r, int) {
+        return float(r);
+    }
+    if isinstance(r, float) {
+        return r;
+    }
+    if isinstance(r, dict) {
+        for k in ["total", "value", "amount", "price"] {
+            if k in r {
+                return serpapi_price_to_float(r.get(k));
+            }
+        }
+        return 0.0;
+    }
+    s = str(r).strip().replace(",", "");
+    if s == "" {
+        return 0.0;
+    }
+    try {
+        return float(s);
+    } except ValueError {
+        return 0.0;
+    }
+}
+
 """Map SerpAPI google_flights JSON to Flight objects (LLM prompt used wrong field names vs Flight.cost/src/dst)."""
 def flights_from_serpapi_results(results: object) -> list[Flight] {
     import from typing { Any }
 
     data: Any = results;
+    sp: Any = data.get("search_parameters");
+    curr = "USD";
+    if isinstance(sp, dict) {
+        c = str(sp.get("currency", "USD")).strip();
+        if c {
+            curr = c;
+        }
+    }
     rows: Any = data.get("best_flights");
     if not rows {
         rows = data.get("other_flights", []);
@@ -239,19 +332,49 @@ def flights_from_serpapi_results(results: object) -> list[Flight] {
                 }
                 flight_num = " · ".join(fn_parts) if len(fn_parts) > 0 else "—";
                 pr: Any = opt.get("price", 0);
-                cost: float = float(pr);
+                cost: float = serpapi_price_to_float(pr);
+                fare_scope = str(opt.get("type", "")).strip();
                 out = out + [
                     Flight(
                         src=src,
                         dst=dst,
                         airline=airline,
                         flight_num=flight_num,
-                        cost=cost
+                        cost=cost,
+                        price_currency=curr,
+                        fare_description=fare_scope
                     )
                 ];
                 idx += 1;
             }
         }
+    }
+    if len(out) == 0 {
+        err_msg = str(data.get("error", "")).strip();
+        si: Any = data.get("search_information");
+        state_note = "";
+        if si {
+            state_note = str(si.get("flights_results_state", "")).strip();
+        }
+        detail = err_msg;
+        if not detail {
+            detail = (
+                f"No itineraries returned ({state_note})."
+                if state_note
+                else "No flight itineraries returned for this search."
+            );
+        }
+        out = out + [
+            Flight(
+                airline="No flights found",
+                flight_num="—",
+                src=detail,
+                dst="Try different dates, a nearby airport, or open the trip on Google Flights.",
+                cost=0.0,
+                price_currency="USD",
+                fare_description=""
+            )
+        ];
     }
     return out;
 }
@@ -306,15 +429,106 @@ def normalize_meal_type(raw: str) -> str {
     return "DINNER";
 }
 
-"""Apply normalize_meal_type to each meal (mutate in place for graph persistence)."""
+"""Apply normalize_meal_type and clean day_date (mutate in place for graph persistence)."""
 def normalize_meals(meals: list[Meal]) -> list[Meal] {
     for m in meals {
         m.mealType = normalize_meal_type(m.mealType);
+        m.day_date = strip_date_quotes(str(m.day_date).strip());
     }
     return meals;
 }
 
-"""Enrich a trip with meal ideas (server-side graph + LLM). Meal city comes from the same TravelEndpoint as flight arrival resolution."""
+"""True if the model picked a navigation heading / junk string instead of a venue."""
+def meal_restaurant_name_is_garbage(name: str) -> bool {
+    s = str(name).strip().lower();
+    if len(s) < 2 {
+        return True;
+    }
+    if s == "menu" or s == "home" or s == "search" {
+        return True;
+    }
+    junk: list[str] = [
+        "table of contents",
+        "skip to",
+        "cookie",
+        "privacy policy",
+        "terms of use",
+        "sign in",
+        "log in",
+        "subscribe",
+        "newsletter",
+        "read more",
+        "click here",
+        "navigation",
+        "related posts",
+        "related articles",
+        "share on",
+        "follow us",
+        "contact us",
+        "about us"
+    ];
+    for phrase in junk {
+        if phrase in s {
+            return True;
+        }
+    }
+    return False;
+}
+
+"""Force day_date from itinerary order so headings always match trip dates (LLM often omits or mis-assigns)."""
+def stitch_meal_day_dates(meals: list[Meal], dates: list[str]) -> list[Meal] {
+    if len(dates) < 1 {
+        return meals;
+    }
+    i: int = 0;
+    for m in meals {
+        slot = int(i / 2);
+        if slot < len(dates) {
+            m.day_date = dates[slot];
+        }
+        i += 1;
+    }
+    return meals;
+}
+
+"""When cheapest meals in the list look like street food / markets (< 30 USD) but others are extreme, cap obvious outliers."""
+def reconcile_meal_cost_outliers(meals: list[Meal]) -> list[Meal] {
+    if len(meals) < 2 {
+        return meals;
+    }
+    lo: float = 1e9;
+    for m in meals {
+        if m.cost < lo {
+            lo = m.cost;
+        }
+    }
+    if lo >= 30.0 {
+        return meals;
+    }
+    ceiling: float = 85.0;
+    if lo * 5.0 + 20.0 < ceiling {
+        ceiling = lo * 5.0 + 20.0;
+    }
+    for m in meals {
+        if m.cost > 120.0 {
+            m.cost = min(m.cost, ceiling);
+        }
+    }
+    return meals;
+}
+
+"""Replace junk venue names; tighten costs. city is used for the fallback label."""
+def sanitize_meal_itinerary(meals: list[Meal], city: str) -> list[Meal] {
+    fb = f"Local spot in {city} (pick a name from search)";
+    for m in meals {
+        if meal_restaurant_name_is_garbage(m.restaurant) {
+            m.restaurant = fb;
+        }
+    }
+    return reconcile_meal_cost_outliers(meals);
+}
+
+"""Build a day-by-day meal itinerary (two meals per day, varied venues). Replaces prior meal list for the trip."""
 def:pub add_meal(trip_id: str) -> list[Meal] {
     for t in [root()-->][?:Trip] {
         if str(jid(t)) == trip_id {
@@ -323,11 +537,26 @@ def:pub add_meal(trip_id: str) -> list[Meal] {
             if not city {
                 city = t.destination.strip();
             }
+            dates = itinerary_dates_list(t.start_date, t.end_date);
+            max_days = 21;
+            if len(dates) > max_days {
+                dates = dates[0:max_days];
+            }
+            num_days = len(dates);
+            if num_days < 1 {
+                dates = [normalize_iso_date_for_serpapi(strip_date_quotes(format_date(t.start_date.strip())))];
+                num_days = 1;
+            }
             web_context = search_web(
-                f"most popular restaurants in {city} with must try dishes and affordable price range"
+                f"named restaurants and food markets in {city} specific venue names "
+                f"locals eat lunch dinner mid-range prices not travel blog navigation"
             );
-            meals = normalize_meals(find_meal_with_context(city, web_context));
-            t.meals = t.meals + meals;
+            dates_csv = ", ".join(dates);
+            meals = find_meal_itinerary_with_context(city, web_context, dates_csv, num_days);
+            meals = normalize_meals(meals);
+            meals = stitch_meal_day_dates(meals, dates);
+            meals = sanitize_meal_itinerary(meals, city);
+            t.meals = meals;
             return t.meals;
         }
     }
@@ -392,7 +621,18 @@ cl def:pub app -> JsxElement {
         out: list[JsxElement] = [];
         idx: int = 0;
         for f in trip.flights {
-            label = f"{f.airline} {f.flight_num}: {f.src} → {f.dst} · " + str(f.cost) + " USD";
+            fare_part = (
+                f" · {f.fare_description}"
+                if str(f.fare_description).strip() != ""
+                else ""
+            );
+            label = (
+                f"{f.airline} {f.flight_num}: {f.src} → {f.dst} · "
+                + str(f.cost)
+                + " "
+                + str(f.price_currency).strip()
+                + fare_part
+            );
             fk = str(jid(trip)) + "-flight-" + str(idx);
             out = out + [
                 <li key={fk} class="flight-item">
@@ -407,8 +647,20 @@ cl def:pub app -> JsxElement {
     def meal_rows(trip: Trip) -> list[JsxElement] {
         out: list[JsxElement] = [];
         idx: int = 0;
+        prev_day: str = "";
         for m in trip.meals {
-            label = f"{m.restaurant} · {m.mealType} · " + str(m.cost) + " USD";
+            day = str(m.day_date).strip();
+            if day != "" and day != prev_day {
+                prev_day = day;
+                hk = str(jid(trip)) + "-meal-day-" + str(idx);
+                out = out + [
+                    <li key={hk} class="meal-day-heading" role="presentation">
+                        <span class="meal-day-label">{day}</span>
+                    </li>
+                ];
+                idx += 1;
+            }
+            label = f"{m.restaurant} · {m.mealType} · ~" + str(m.cost) + " USD (estimate)";
             meal_key = str(jid(trip)) + "-meal-" + str(idx);
             out = out + [
                 <li key={meal_key} class="meal-item">
@@ -443,25 +695,33 @@ cl def:pub app -> JsxElement {
                             class="btn btn-secondary"
                             onClick={lambda { add_new_meal(trip); }}
                         >
-                            Find meals
+                            Build meal itinerary
                         </button>
                     </div>
                 </div>
                 <section class="trip-subsection" aria-label="Flights">
-                    <h3 class="subsection-title">Flights (Tavily)</h3>
-                    <p class="trip-hint">Search live fares; we keep the three lowest USD estimates from the results.</p>
+                    <h3 class="subsection-title">Flights (SerpAPI)</h3>
+                    <p class="trip-hint">
+                        Fares are the numbers SerpAPI returns — we request currency USD and do not convert from other
+                        currencies. Default search is round trip; the price is usually the total for both directions,
+                        not per leg. Meal costs elsewhere are rough AI estimates in USD, not live menu prices.
+                    </p>
                     {
                         <ul class="flight-list">{flight_rows(trip)}</ul>
                         if len(trip.flights) > 0
-                        else <p class="trip-empty">No search yet — use the 3 cheapest flights button (needs TAVILY_API_KEY).</p>
+                        else <p class="trip-empty">No search yet — use &quot;3 cheapest flights&quot; to query SerpAPI.</p>
                     }
                 </section>
-                <section class="trip-subsection" aria-label="Meals">
-                    <h3 class="subsection-title">Meals</h3>
+                <section class="trip-subsection" aria-label="Meal itinerary">
+                    <h3 class="subsection-title">Meal itinerary</h3>
+                    <p class="trip-hint">
+                        Two meals per trip day (lunch and dinner), with different restaurants when possible.
+                        Long trips: first 21 days only.
+                    </p>
                     {
                         <ul class="meal-list">{meal_rows(trip)}</ul>
                         if len(trip.meals) > 0
-                        else <p class="trip-empty">No meal ideas yet — use Find meals for AI suggestions.</p>
+                        else <p class="trip-empty">No itinerary yet — use Find meals to build one from your dates.</p>
                     }
                 </section>
             </article>;

@@ -225,6 +225,25 @@ body {
   gap: 0.5rem;
 }
 
+.meal-day-heading {
+  list-style: none;
+  margin: 0.85rem 0 0.15rem;
+  padding: 0;
+}
+
+.meal-day-heading:first-child {
+  margin-top: 0;
+}
+
+.meal-day-label {
+  display: block;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
 .meal-item {
   font-size: 0.9375rem;
   padding: 0.5rem 0.65rem;

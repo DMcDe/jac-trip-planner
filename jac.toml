@@ -4,6 +4,9 @@ version = "1.0.0"
 description = "Jac client application: trip-planner"
 entry-point = "main.jac"
 
+[dependencies]
+google-search-results = "~=2.4"
+
 [dependencies.npm]
 react = "^18.2.0"
 react-dom = "^18.2.0"
