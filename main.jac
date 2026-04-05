@@ -184,14 +184,94 @@ def normalize_airport_code_for_serpapi(raw: str) -> str {
     return s;
 }
 
+"""True if code looks like a real 3-letter IATA (not empty, not a common English trigram from snippets)."""
+def iata_candidate_is_common_word(cand: str) -> bool {
+    c = str(cand).upper();
+    return (
+        c == "THE"
+        or c == "AND"
+        or c == "FOR"
+        or c == "NOT"
+        or c == "ARE"
+        or c == "BUT"
+        or c == "YOU"
+        or c == "ALL"
+        or c == "CAN"
+        or c == "HER"
+        or c == "WAS"
+        or c == "ONE"
+        or c == "OUR"
+        or c == "OUT"
+        or c == "DAY"
+        or c == "NEW"
+    );
+}
+
+def travel_iata_code_valid(code: str) -> bool {
+    s = str(code).strip().upper();
+    if len(s) != 3 {
+        return False;
+    }
+    c0 = s[0];
+    c1 = s[1];
+    c2 = s[2];
+    if not (c0 >= "A" and c0 <= "Z" and c1 >= "A" and c1 <= "Z" and c2 >= "A" and c2 <= "Z") {
+        return False;
+    }
+    if iata_candidate_is_common_word(s) {
+        return False;
+    }
+    return True;
+}
+
+"""Scan Tavily/LLM text for first plausible AAA pattern (fallback when structured iata is empty)."""
+def first_likely_iata_from_text(text: str) -> str {
+    u = str(text).upper();
+    n = len(u);
+    i = 0;
+    while i <= n - 3 {
+        c0 = u[i];
+        c1 = u[i + 1];
+        c2 = u[i + 2];
+        if (c0 >= "A" and c0 <= "Z" and c1 >= "A" and c1 <= "Z" and c2 >= "A" and c2 <= "Z") {
+            cand = u[i:i + 3];
+            if not iata_candidate_is_common_word(cand) {
+                return cand;
+            }
+        }
+        i += 1;
+    }
+    return "";
+}
+
+"""Google Flights via SerpAPI often rejects metro-style multi-airport codes; map to a primary airport."""
+def serpapi_airport_code_alias(code: str) -> str {
+    s = str(code).strip().upper();
+    if s == "DTT" {
+        return "DTW";
+    }
+    return s;
+}
+
 def find_flights_serpapi(departure: str, arrival: str, outbound_date: str, return_date: str) -> object {
     # google-search-results exposes SerpApiClient + get_dict(), not serpapi.Client (that is the newer pip "serpapi" package).
+
+    d = str(departure).strip();
+    a = str(arrival).strip();
+    if d == "" or a == "" {
+        return {
+            "error": (
+                "Missing departure_id or arrival_id. "
+                "Try spelling the city or airport more specifically (e.g. Detroit MI, Los Angeles)."
+            )
+        };
+    }
 
     client = SerpApiClient(
         {
             "engine": "google_flights",
-            "departure_id": departure,
-            "arrival_id": arrival,
+            "departure_id": d,
+            "arrival_id": a,
             "currency": "USD",
             "type": "1",
             "outbound_date": outbound_date,
@@ -236,17 +316,42 @@ Return TravelEndpoint:
 
 Use place_text together with web_context to resolve ambiguity: pick the airport that serves the geographic location the user meant (including spelling variants), not a distant or unrelated namesake. If web_context is empty or unusable, infer carefully from place_text only.
 
-iata must be three A-Z letters. meal_city must be a place name, not a code.
+iata must be three A-Z letters — never empty. meal_city must be a place name, not a code.
 """;
 
 """One Tavily + one structured parse per place; SerpAPI and meals both use this so they stay aligned."""
 def resolve_place_for_travel(place_text: str) -> TravelEndpoint {
-    ctx = airport_facts_context(place_text.strip());
-    ep = parse_travel_endpoint(place_text.strip(), ctx);
-    return TravelEndpoint(
-        iata=normalize_airport_code_for_serpapi(strip_date_quotes(str(ep.iata).strip())),
-        meal_city=strip_date_quotes(str(ep.meal_city).strip())
-    );
+    p = place_text.strip();
+    ctx = airport_facts_context(p);
+    ep = parse_travel_endpoint(p, ctx);
+    iata = normalize_airport_code_for_serpapi(strip_date_quotes(str(ep.iata).strip()));
+    meal_city = strip_date_quotes(str(ep.meal_city).strip());
+    if not travel_iata_code_valid(iata) {
+        mined = first_likely_iata_from_text(ctx + " " + str(ep.iata));
+        if travel_iata_code_valid(mined) {
+            iata = mined;
+        }
+    }
+    if not travel_iata_code_valid(iata) {
+        ctx2 = tavily_search(
+            f"IATA airport code (3 letters) for scheduled airline flights to or from: {p}. "
+            f"Official busiest passenger airport used on Google Flights.",
+            5
+        );
+        ep2 = parse_travel_endpoint(p, ctx + "\n\n" + ctx2);
+        iata = normalize_airport_code_for_serpapi(strip_date_quotes(str(ep2.iata).strip()));
+        if not travel_iata_code_valid(iata) {
+            mined = first_likely_iata_from_text(ctx + "\n" + ctx2 + " " + str(ep2.iata));
+            if travel_iata_code_valid(mined) {
+                iata = mined;
+            }
+        }
+        if meal_city == "" {
+            meal_city = strip_date_quotes(str(ep2.meal_city).strip());
+        }
+    }
+    iata = serpapi_airport_code_alias(iata);
+    return TravelEndpoint(iata=iata, meal_city=meal_city);
 }
 
 """Normalize SerpAPI best_flights price (usually int USD); no FX math in this app."""
@@ -395,7 +500,11 @@ def:pub conduct_flight_search(trip_id: str) -> list[Flight] {
             api_output = find_flights_serpapi(departure_airport, arrival_airport, departure_date, arrival_date);
             print(api_output);
             flights = flights_from_serpapi_results(api_output);
-            t.total_cost = t.total_cost - t.flights[0].cost;
+            prev_flight_cost: float = 0.0;
+            if len(t.flights) > 0 {
+                prev_flight_cost = t.flights[0].cost;
+            }
+            t.total_cost = t.total_cost - prev_flight_cost;
             t.flights = flights;
             t.total_cost = t.total_cost + flights[0].cost;
             return flights;
@@ -737,7 +846,7 @@ cl def:pub app -> JsxElement {
     }
 
     def trip_grid_cards() -> list[JsxElement] {
-        current_trips = trips if (trips is not None) else [];
+        current_trips = trips;
         return [trip_card(trip=t) for t in current_trips];
     }
 
