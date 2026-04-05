@@ -619,6 +619,10 @@ cl def:pub app -> JsxElement {
         trips = [x for x in trips];
     }
 
+    def date_picker() -> JsxElement {
+        
+    }
+
     def flight_rows(trip: Trip) -> list[JsxElement] {
         out: list[JsxElement] = [];
         idx: int = 0;
@@ -733,7 +737,8 @@ cl def:pub app -> JsxElement {
     }
 
     def trip_grid_cards() -> list[JsxElement] {
-        return [trip_card(trip=t) for t in trips];
+        current_trips = trips if (trips is not None) else [];
+        return [trip_card(trip=t) for t in current_trips];
     }
 
     return
@@ -783,13 +788,13 @@ cl def:pub app -> JsxElement {
                             <span class="field-label">Start</span>
                             <input
                                 id="start-input"
+                                type="date"
                                 class="input"
                                 value={start_date_text}
                                 onChange={lambda e: ChangeEvent { start_date_text = e.target.value; }}
                                 onKeyDown={lambda e: KeyboardEvent {
                                     if e.key == "Enter" { add_new_trip(); }
                                 }}
-                                placeholder="YYYY-MM-DD"
                                 autoComplete="off"
                             />
                         </label>
@@ -797,13 +802,13 @@ cl def:pub app -> JsxElement {
                             <span class="field-label">End</span>
                             <input
                                 id="end-input"
+                                type="date"
                                 class="input"
                                 value={end_date_text}
                                 onChange={lambda e: ChangeEvent { end_date_text = e.target.value; }}
                                 onKeyDown={lambda e: KeyboardEvent {
                                     if e.key == "Enter" { add_new_trip(); }
                                 }}
-                                placeholder="YYYY-MM-DD"
                                 autoComplete="off"
                             />
                         </label>
