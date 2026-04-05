@@ -475,10 +475,10 @@ cl def:pub app -> JsxElement {
         <div class="app">
             <header class="site-header">
                 <div class="site-header-inner">
-                    <p class="eyebrow">Jac trip planner</p>
+                    <p class="eyebrow">AItinerary</p>
                     <h1 class="site-title">Plan trips and discover meals</h1>
                     <p class="site-lede">
-                        Tavily finds the three cheapest flight estimates per trip; the model parses meals from search too.
+                        We will find you the three cheapest round flight estimates per trip.
                     </p>
                 </div>
             </header>
