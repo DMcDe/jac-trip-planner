@@ -3,6 +3,10 @@
 import from byllm.lib { Model }
 import os, requests;
 import from dotenv { load_dotenv }
+import from serpapi.serp_api_client { SerpApiClient }
+import from typing { Any }
+import datetime;
+
 
 cl import "./styles.css";
 
@@ -52,8 +56,6 @@ sem Meal.day_date = "ISO date YYYY-MM-DD for this meal slot in the trip itinerar
 
 """Call Tavily search API; returns answer line plus page snippets (shared by meals + flights)."""
 def tavily_search(query: str, max_results: int) -> str {
-    import from typing { Any }
-
     load_dotenv();
     api_key = os.getenv("TAVILY_API_KEY");
     if not api_key {
@@ -97,8 +99,6 @@ sem search_web = "Use Tavily live web search to gather current public web inform
 
 """Inclusive calendar dates from trip start to end (YYYY-MM-DD), normalized like flight dates."""
 def itinerary_dates_list(start_raw: str, end_raw: str) -> list[str] {
-    import datetime;
-
     s = normalize_iso_date_for_serpapi(strip_date_quotes(format_date(start_raw.strip())));
     e = normalize_iso_date_for_serpapi(strip_date_quotes(format_date(end_raw.strip())));
     d0 = datetime.date.fromisoformat(s);
@@ -152,7 +152,6 @@ def strip_date_quotes(d: str) -> str {
 
 """SerpAPI requires real calendar dates. LLM often emits impossible months (e.g. 2026-15-05 from US 5/15/2026)."""
 def normalize_iso_date_for_serpapi(raw: str) -> str {
-    import datetime;
 
     s = str(raw).strip();
     parts = s.split("-");
@@ -187,7 +186,6 @@ def normalize_airport_code_for_serpapi(raw: str) -> str {
 
 def find_flights_serpapi(departure: str, arrival: str, outbound_date: str, return_date: str) -> object {
     # google-search-results exposes SerpApiClient + get_dict(), not serpapi.Client (that is the newer pip "serpapi" package).
-    import from serpapi.serp_api_client { SerpApiClient }
 
     client = SerpApiClient(
         {
@@ -253,7 +251,6 @@ def resolve_place_for_travel(place_text: str) -> TravelEndpoint {
 
 """Normalize SerpAPI best_flights price (usually int USD); no FX math in this app."""
 def serpapi_price_to_float(raw: object) -> float {
-    import from typing { Any }
 
     r: Any = raw;
     if r is None {
@@ -289,7 +286,6 @@ def serpapi_price_to_float(raw: object) -> float {
 
 """Map SerpAPI google_flights JSON to Flight objects (LLM prompt used wrong field names vs Flight.cost/src/dst)."""
 def flights_from_serpapi_results(results: object) -> list[Flight] {
-    import from typing { Any }
 
     data: Any = results;
     sp: Any = data.get("search_parameters");
@@ -398,7 +394,11 @@ def:pub conduct_flight_search(trip_id: str) -> list[Flight] {
             );
             api_output = find_flights_serpapi(departure_airport, arrival_airport, departure_date, arrival_date);
             print(api_output);
-            return flights_from_serpapi_results(api_output);
+            flights = flights_from_serpapi_results(api_output);
+            t.total_cost = t.total_cost - t.flights[0].cost;
+            t.flights = flights;
+            t.total_cost = t.total_cost + flights[0].cost;
+            return flights;
         }
     }
     return [];
@@ -556,7 +556,9 @@ def:pub add_meal(trip_id: str) -> list[Meal] {
             meals = normalize_meals(meals);
             meals = stitch_meal_day_dates(meals, dates);
             meals = sanitize_meal_itinerary(meals, city);
+            t.total_cost = t.total_cost - sum(m.cost for m in t.meals);
             t.meals = meals;
+            t.total_cost = t.total_cost + sum(m.cost for m in meals);
             return t.meals;
         }
     }
@@ -675,6 +677,9 @@ cl def:pub app -> JsxElement {
     def trip_card(trip: Trip) -> JsxElement {
         return
             <article class="trip-card" key={jid(trip)}>
+                <div class="trip-cost">
+                    <p>Total Cost: ${trip.total_cost.toFixed(2)}</p>
+                </div>
                 <div class="trip-card-head">
                     <div class="trip-title-block">
                         <h2 class="trip-destination">{trip.destination}</h2>
@@ -688,14 +693,14 @@ cl def:pub app -> JsxElement {
                             class="btn btn-secondary"
                             onClick={lambda { search_cheapest_flights(trip); }}
                         >
-                            3 cheapest flights
+                            Cheapest Flights
                         </button>
                         <button
                             type="button"
                             class="btn btn-secondary"
                             onClick={lambda { add_new_meal(trip); }}
                         >
-                            Build meal itinerary
+                            Build Meal Itinerary
                         </button>
                     </div>
                 </div>
@@ -736,7 +741,7 @@ cl def:pub app -> JsxElement {
             <header class="site-header">
                 <div class="site-header-inner">
                     <p class="eyebrow">AItinerary</p>
-                    <h1 class="site-title">Plan trips and discover meals</h1>
+                    <h1 class="site-title">Plan Trips and Discover Meals</h1>
                     <p class="site-lede">
                         We will find you the three cheapest round flight estimates per trip.
                     </p>
